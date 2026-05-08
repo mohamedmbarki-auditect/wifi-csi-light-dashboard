@@ -3,7 +3,6 @@
 import time, asyncio, logging, queue
 from pathlib import Path
 from collections import deque
-import re
 import numpy as np
 import serial
 from fastapi import FastAPI, WebSocket
@@ -20,14 +19,11 @@ CONFIG = {
     "smoothing_window": 50,
     "ema_alpha": 0.1,
     "presence_threshold": 0.3,
-    "movement_threshold": 0.15,
+    "movement_threshold": 1.0,
     "calibration_samples": 200,
     "spatial_bins": 8,
     "db_path": "data/light_csi.db",
 }
-
-# Regex to find CSI_DATA lines with their data
-CSI_LINE_RE = re.compile(rb'CSI_DATA,(\d+),([0-9a-f:]+),(-?\d+),(\d+),(-?\d+),(\d+),(\d+),(\d+),(\d+),(-?\d+),(\d+),(\d+),(\d+),(\d+),\"\[([^\"]+)\]')
 
 class CSIReader:
     def __init__(self, port, baud, output_queue):
@@ -62,11 +58,9 @@ class CSIReader:
         """Extract complete CSI_DATA lines from buffer"""
         text = self._buffer.decode("utf-8", errors="replace")
         
-        # Find all CSI_DATA patterns using simple string search
         while "CSI_DATA," in text:
             start = text.find("CSI_DATA,")
             
-            # Find the end - look for ] followed by newline or another CSI_DATA
             end = -1
             search_start = start + 10
             for _ in range(100):
@@ -80,14 +74,13 @@ class CSIReader:
                 search_start = bracket_pos + 1
             
             if end == -1:
-                # Not complete yet
                 if start > 0:
                     self._buffer = text[start].encode()
                 break
             
             line = text[start:end].strip()
             if line:
-                self.output_queue.put((line, text[end:end+200]))  # Also pass remainder for debugging
+                self.output_queue.put(line)
             
             text = text[end:]
             self._buffer = text.encode()
@@ -111,6 +104,17 @@ class CSIProcessor:
         self.baseline_amplitude = None
         self.position_history = deque(maxlen=50)
         self.frame_count = 0
+        self.calibration_in_progress = False
+        
+    def start_calibration(self):
+        """Manually start calibration (reset and recalibrate)"""
+        self.calibration_buffer.clear()
+        self.is_calibrated = False
+        self.baseline_amplitude = None
+        self.calibration_in_progress = True
+        self.smoothed_presence = 0.0
+        self.smoothed_movement = 0.0
+        logger.info("Calibration started")
         
     def process(self, line):
         """Process a CSI_DATA line - robust parsing"""
@@ -118,7 +122,6 @@ class CSIProcessor:
             return None
             
         try:
-            # Find the CSI data between [ and ]
             bracket_start = line.find("\"[")
             bracket_end = line.find("]", bracket_start)
             
@@ -127,7 +130,6 @@ class CSIProcessor:
                 
             csi_raw = line[bracket_start+2:bracket_end]
             
-            # Parse CSI values
             csi_values = []
             for v in csi_raw.split(","):
                 v = v.strip()
@@ -139,11 +141,8 @@ class CSIProcessor:
             if len(csi_values) < 4:
                 return None
             
-            # Get RSSI - it's the 4th field (index 3)
             parts = line.split(",")
             rssi = float(parts[3])
-            
-            # Get MAC - it's the 3rd field (index 2)
             mac = parts[2].strip()
             
             n_pairs = len(csi_values) // 2
@@ -160,13 +159,16 @@ class CSIProcessor:
             
             if len(recent_amps) < 10:
                 return self._get_status(calibrating=True)
-                
+            
+            # Calibration phase
             if not self.is_calibrated:
                 spatial_std = float(np.std(amplitude))
                 self.calibration_buffer.append(spatial_std)
+                
                 if len(self.calibration_buffer) >= self.config["calibration_samples"]:
                     self.baseline_amplitude = float(np.median(list(self.calibration_buffer)))
                     self.is_calibrated = True
+                    self.calibration_in_progress = False
                     logger.info(f"Calibrated: baseline={self.baseline_amplitude:.2f}")
                 return self._get_status(calibrating=True)
                 
@@ -240,8 +242,9 @@ class CSIProcessor:
         return {
             "type": "update",
             "timestamp": timestamp or time.time(),
-            "calibrating": calibrating,
+            "calibrating": calibrating or self.calibration_in_progress,
             "calibration_progress": min(1.0, len(self.calibration_buffer) / self.config["calibration_samples"]),
+            "baseline": round(self.baseline_amplitude, 2) if self.baseline_amplitude else None,
             "presence": bool(presence),
             "movement": bool(movement),
             "presence_value": round(self.smoothed_presence, 4),
@@ -273,6 +276,36 @@ async def get_status():
         return processor._get_status(not processor.is_calibrated)
     return {"error": "Not initialized"}
 
+@app.post("/calibrate")
+async def calibrate():
+    """Manually trigger calibration"""
+    if processor:
+        processor.start_calibration()
+        return {"status": "ok", "message": "Calibration started. Please ensure room is empty."}
+    return {"status": "error", "message": "Processor not initialized"}
+
+@app.get("/calibration-status")
+async def calibration_status():
+    """Get calibration details"""
+    if processor:
+        return {
+            "is_calibrated": processor.is_calibrated,
+            "calibration_in_progress": processor.calibration_in_progress,
+            "baseline": round(processor.baseline_amplitude, 2) if processor.baseline_amplitude else None,
+            "samples_collected": len(processor.calibration_buffer),
+            "samples_needed": CONFIG["calibration_samples"],
+        }
+    return {"error": "Not initialized"}
+
+@app.post("/threshold")
+async def set_threshold(presence: float = 0.3, movement: float = 1.0):
+    """Update detection thresholds"""
+    if processor:
+        processor.presence_threshold = presence
+        processor.movement_threshold = movement
+        return {"status": "ok", "presence_threshold": presence, "movement_threshold": movement}
+    return {"status": "error"}
+
 @app.websocket("/ws")
 async def websocket(ws: WebSocket):
     await ws.accept()
@@ -303,10 +336,8 @@ async def collection_loop():
     parse_count = 0
     while running:
         try:
-            item = serial_queue.get(timeout=0.1)
-            if item:
-                # Handle both old format (string) and new format (tuple)
-                line = item[0] if isinstance(item, tuple) else item
+            line = serial_queue.get(timeout=0.1)
+            if line:
                 status = processor.process(line)
                 if status:
                     parse_count += 1
@@ -333,7 +364,6 @@ async def startup():
     
     processor = CSIProcessor(CONFIG)
     
-    # Start serial reader in background thread
     reader = CSIReader(CONFIG["serial_port"], CONFIG["baud_rate"], serial_queue)
     serial_reader_thread = threading.Thread(target=reader.run, daemon=True)
     serial_reader_thread.start()
