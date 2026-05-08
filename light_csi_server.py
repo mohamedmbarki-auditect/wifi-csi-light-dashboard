@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Lightweight CSI Dashboard - Presence & Movement Detection"""
+"""Lightweight CSI Dashboard - Presence & Movement Detection
+Using variance-based detection: fluctuating signal = presence, stable signal = absence
+"""
 import time, asyncio, logging, queue
 from pathlib import Path
 from collections import deque
@@ -18,7 +20,9 @@ CONFIG = {
     "baud_rate": 115200,
     "smoothing_window": 50,
     "ema_alpha": 0.1,
-    "presence_threshold": 0.3,
+    # Presence: variance-based detection (fluctuation = presence, stable = absence)
+    "presence_variance_threshold": 0.0005,  # variance of presence_value
+    # Movement: still threshold-based (needs strong movement)
     "movement_threshold": 1.0,
     "calibration_samples": 200,
     "spatial_bins": 8,
@@ -90,15 +94,22 @@ class CSIProcessor:
         self.config = config
         self.smoothing_window = config["smoothing_window"]
         self.ema_alpha = config["ema_alpha"]
-        self.presence_threshold = config["presence_threshold"]
         self.movement_threshold = config["movement_threshold"]
+        self.presence_variance_threshold = config["presence_variance_threshold"]
         self.spatial_bins = config["spatial_bins"]
+        
+        # Signal history for detection
         self.amplitude_history = deque(maxlen=self.smoothing_window * 2)
         self.phase_history = deque(maxlen=self.smoothing_window)
         self.rssi_history = deque(maxlen=100)
+        
+        # Presence value tracking for variance detection
+        self.presence_value_history = deque(maxlen=100)  # recent presence values
         self.smoothed_presence = 0.0
         self.smoothed_movement = 0.0
         self.smoothed_rssi = -50.0
+        
+        # Calibration
         self.calibration_buffer = deque(maxlen=config["calibration_samples"])
         self.is_calibrated = False
         self.baseline_amplitude = None
@@ -109,6 +120,7 @@ class CSIProcessor:
     def start_calibration(self):
         """Manually start calibration (reset and recalibrate)"""
         self.calibration_buffer.clear()
+        self.presence_value_history.clear()
         self.is_calibrated = False
         self.baseline_amplitude = None
         self.calibration_in_progress = True
@@ -117,7 +129,7 @@ class CSIProcessor:
         logger.info("Calibration started")
         
     def process(self, line):
-        """Process a CSI_DATA line - robust parsing"""
+        """Process a CSI_DATA line"""
         if not line or not line.startswith("CSI_DATA,"):
             return None
             
@@ -172,12 +184,16 @@ class CSIProcessor:
                     logger.info(f"Calibrated: baseline={self.baseline_amplitude:.2f}")
                 return self._get_status(calibrating=True)
                 
+            # === DETECTION METRICS ===
             spatial_variance = float(np.std(amplitude))
+            
+            # Temporal variance (for movement)
             if len(recent_amps) >= 20:
                 temporal_variance = float(np.var(np.mean(recent_amps, axis=1)))
             else:
                 temporal_variance = 0.0
                 
+            # Phase rate (for movement)
             if len(self.phase_history) >= 5:
                 phase_changes = []
                 for i in range(len(self.phase_history) - 1):
@@ -186,20 +202,50 @@ class CSIProcessor:
             else:
                 phase_rate = 0.0
                 
+            # === RAW VALUES ===
             baseline = self.baseline_amplitude or 1.0
             raw_presence = min(1.0, spatial_variance / (baseline * 1.5))
             raw_movement = min(1.0, temporal_variance / (baseline * 0.5 + 0.1))
             combined_movement = raw_movement * 0.6 + phase_rate * 2.0 * 0.4
             
+            # EMA smoothing for raw values
             self.smoothed_presence = self.ema_alpha * raw_presence + (1 - self.ema_alpha) * self.smoothed_presence
             self.smoothed_movement = self.ema_alpha * combined_movement + (1 - self.ema_alpha) * self.smoothed_movement
             self.smoothed_rssi = 0.1 * rssi + 0.9 * self.smoothed_rssi
             
+            # Store presence value for variance calculation
+            self.presence_value_history.append(self.smoothed_presence)
+            
+            # === VARIANCE-BASED PRESENCE DETECTION ===
+            # Fluctuating presence_value = person present
+            # Stable presence_value = nobody (empty room)
+            presence_variance = float(np.var(list(self.presence_value_history)[-30:])) if len(self.presence_value_history) >= 30 else 0.0
+            
+            # Binary presence based on variance
+            # If variance is high → fluctuating → person present
+            # If variance is low → stable → nobody
+            presence_detected = presence_variance > self.presence_variance_threshold
+            
+            # === MOVEMENT DETECTION (threshold-based) ===
+            movement_detected = self.smoothed_movement > self.movement_threshold
+            
+            # === STABILITY METRIC ===
+            # 1.0 = completely stable (empty room)
+            # 0.0 = very fluctuating (person moving)
+            stability = max(0, 1.0 - (presence_variance * 2000))  # scale variance to 0-1
+            
+            # Position estimation
             position = self._estimate_position(amplitude, phase)
             self.position_history.append(position)
             spatial_profile = self._get_spatial_profile(amplitude)
             
-            return self._get_status(calibrating=False, spatial_profile=spatial_profile, timestamp=time.time())
+            return self._get_status(
+                calibrating=False, 
+                spatial_profile=spatial_profile, 
+                timestamp=time.time(),
+                presence_variance=presence_variance,
+                stability=stability
+            )
             
         except Exception as e:
             logger.debug(f"Parse error: {e}")
@@ -229,9 +275,7 @@ class CSIProcessor:
                 profile = [v / mean_val for v in profile]
         return profile
         
-    def _get_status(self, calibrating, spatial_profile=None, timestamp=None):
-        presence = self.smoothed_presence > self.presence_threshold
-        movement = self.smoothed_movement > self.movement_threshold
+    def _get_status(self, calibrating, spatial_profile=None, timestamp=None, presence_variance=None, stability=None):
         positions = list(self.position_history)
         avg_position = float(np.mean(positions)) if positions else 0.5
         direction = 0
@@ -239,20 +283,33 @@ class CSIProcessor:
             recent = np.mean(positions[-3:])
             older = np.mean(positions[-6:-3])
             direction = 1 if recent > older + 0.05 else (-1 if recent < older - 0.05 else 0)
+            
         return {
             "type": "update",
             "timestamp": timestamp or time.time(),
             "calibrating": calibrating or self.calibration_in_progress,
             "calibration_progress": min(1.0, len(self.calibration_buffer) / self.config["calibration_samples"]),
             "baseline": round(self.baseline_amplitude, 2) if self.baseline_amplitude else None,
-            "presence": bool(presence),
-            "movement": bool(movement),
+            
+            # Presence detection (variance-based)
+            "presence": bool(presence_variance > self.presence_variance_threshold) if presence_variance is not None else False,
             "presence_value": round(self.smoothed_presence, 4),
+            "presence_variance": round(presence_variance, 6) if presence_variance else 0,
+            "stability": round(stability, 4) if stability else 1.0,
+            
+            # Movement detection (threshold-based)
+            "movement": self.smoothed_movement > self.movement_threshold,
             "movement_value": round(self.smoothed_movement, 4),
+            
+            # Position
             "position": round(avg_position, 3),
             "position_raw": positions[-1] if positions else 0.5,
             "direction": direction,
+            
+            # Spatial
             "spatial_profile": spatial_profile or [1.0] * self.spatial_bins,
+            
+            # Signal quality
             "rssi": round(self.smoothed_rssi, 1),
             "stable": len(self.amplitude_history) >= self.smoothing_window,
             "frame_count": self.frame_count,
@@ -298,12 +355,12 @@ async def calibration_status():
     return {"error": "Not initialized"}
 
 @app.post("/threshold")
-async def set_threshold(presence: float = 0.3, movement: float = 1.0):
+async def set_threshold(presence: float = 0.0005, movement: float = 1.0):
     """Update detection thresholds"""
     if processor:
-        processor.presence_threshold = presence
+        processor.presence_variance_threshold = presence
         processor.movement_threshold = movement
-        return {"status": "ok", "presence_threshold": presence, "movement_threshold": movement}
+        return {"status": "ok", "presence_variance_threshold": presence, "movement_threshold": movement}
     return {"status": "error"}
 
 @app.websocket("/ws")

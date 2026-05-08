@@ -90,7 +90,7 @@
         
         .calibration-info {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 15px;
             margin-bottom: 15px;
         }
@@ -213,7 +213,7 @@
         }
         
         .threshold-item input {
-            width: 80px;
+            width: 100px;
             padding: 6px 10px;
             border-radius: 4px;
             border: 1px solid var(--border);
@@ -292,6 +292,12 @@
         .status-label {
             font-size: 0.9rem;
             color: var(--text-dim);
+        }
+        
+        .status-sublabel {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            margin-top: 5px;
         }
         
         /* === POSITION VISUALIZATION === */
@@ -491,6 +497,29 @@
         .log-absent { color: var(--absent); }
         
         .hidden { display: none; }
+        
+        /* === STABILITY INDICATOR === */
+        .stability-bar {
+            margin-top: 10px;
+            height: 6px;
+            background: var(--bg);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        
+        .stability-fill {
+            height: 100%;
+            transition: width 0.3s, background 0.3s;
+            border-radius: 3px;
+        }
+        
+        .stability-fill.stable {
+            background: var(--absent);
+        }
+        
+        .stability-fill.unstable {
+            background: var(--present);
+        }
     </style>
 </head>
 <body>
@@ -522,12 +551,16 @@
                 <div class="calib-value" id="samplesValue">0/200</div>
             </div>
             <div class="calib-item">
-                <div class="calib-label">Presence</div>
-                <div class="calib-value" id="presenceValueDisplay">0.00</div>
+                <div class="calib-label">Variance</div>
+                <div class="calib-value" id="varianceValue">0.000</div>
             </div>
             <div class="calib-item">
-                <div class="calib-label">Movement</div>
-                <div class="calib-value" id="movementValueDisplay">0.00</div>
+                <div class="calib-label">Stability</div>
+                <div class="calib-value" id="stabilityValue">--</div>
+            </div>
+            <div class="calib-item">
+                <div class="calib-label">Presence</div>
+                <div class="calib-value" id="presenceValueDisplay">0.00</div>
             </div>
         </div>
         
@@ -544,8 +577,8 @@
         
         <div class="threshold-controls">
             <div class="threshold-item">
-                <label>Presence Threshold:</label>
-                <input type="number" id="presenceThreshold" value="0.3" step="0.1" min="0.1" max="1.0" onchange="updateThresholds()">
+                <label>Variance Threshold:</label>
+                <input type="number" id="presenceThreshold" value="0.0005" step="0.0001" min="0.0001" max="0.01" onchange="updateThresholds()">
             </div>
             <div class="threshold-item">
                 <label>Movement Threshold:</label>
@@ -563,10 +596,15 @@
                 <div id="presenceBox" class="status-box absent">
                     <div class="status-value" id="presenceValueText">--</div>
                     <div class="status-label">Presence</div>
+                    <div class="stability-bar">
+                        <div id="stabilityBar" class="stability-fill stable" style="width: 100%"></div>
+                    </div>
+                    <div class="status-sublabel" id="stabilityLabel">Stability: --</div>
                 </div>
                 <div id="movementBox" class="status-box absent">
                     <div class="status-value" id="movementValueText">--</div>
                     <div class="status-label">Movement</div>
+                    <div class="status-sublabel" id="movementSublabel">Index: --</div>
                 </div>
             </div>
         </div>
@@ -816,10 +854,14 @@
             document.getElementById('samplesValue').textContent = 
                 `${samplesCollected}/${samplesNeeded}`;
             
+            // Variance and stability
+            document.getElementById('varianceValue').textContent = 
+                (data.presence_variance || 0).toFixed(5);
+            document.getElementById('stabilityValue').textContent = 
+                ((data.stability || 0) * 100).toFixed(0) + '%';
+            
             document.getElementById('presenceValueDisplay').textContent = 
-                data.presence_value.toFixed(2);
-            document.getElementById('movementValueDisplay').textContent = 
-                data.movement_value.toFixed(2);
+                (data.presence_value || 0).toFixed(2);
             
             if (data.calibrating) {
                 updateCalibrationUI(true, data.calibration_progress);
@@ -834,6 +876,18 @@
             
             document.getElementById('presenceValueText').textContent = data.presence ? 'YES' : 'NO';
             document.getElementById('movementValueText').textContent = data.movement ? 'MVG' : 'STL';
+            
+            // Stability bar
+            const stabilityBar = document.getElementById('stabilityBar');
+            const stabilityLabel = document.getElementById('stabilityLabel');
+            const stabilityPct = (data.stability || 0) * 100;
+            stabilityBar.style.width = stabilityPct + '%';
+            stabilityBar.className = 'stability-fill ' + (stabilityPct > 50 ? 'stable' : 'unstable');
+            stabilityLabel.textContent = 'Stability: ' + stabilityPct.toFixed(0) + '%';
+            
+            // Movement sublabel
+            document.getElementById('movementSublabel').textContent = 
+                'Index: ' + (data.movement_value || 0).toFixed(2);
             
             // Update history for charts
             const presenceValue = data.presence_value || 0;
@@ -929,7 +983,9 @@
                 <span class="log-status ${presClass}">${data.presence ? 'PRESENT' : 'ABSENT'}</span>
                 <span class="log-status ${movClass}">${data.movement ? '| MOVING' : ''}</span>
                 <span style="margin-left: 15px; color: var(--text-dim)">
-                    pos: ${((data.position || 0.5) * 3).toFixed(1)}m | rssi: ${(data.rssi || 0).toFixed(0)}
+                    stab: ${((data.stability || 0) * 100).toFixed(0)}% | 
+                    var: ${(data.presence_variance || 0).toFixed(5)} |
+                    rssi: ${(data.rssi || 0).toFixed(0)}
                 </span>
             `;
             
